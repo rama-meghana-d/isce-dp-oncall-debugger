@@ -1,4 +1,4 @@
-
+```java
 ❯ /vessel-event-investigation                                                                                                                                                                            
 journey_id: 05cd1336-c792-418b-a353-6ea0262118fe
 
@@ -190,3 +190,4 @@ possible timezone conversion error or display bug in the CP layer.
     If the reporter is seeing a specific wrong date/time, capture the                                                                                                                                      
     exact value shown in the UI and share with CP team for debugging.                                                                                                                                      
 ═══════════════════════════════════════════════════════        
+```
