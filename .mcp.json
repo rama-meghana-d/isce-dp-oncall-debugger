@@ -1,0 +1,68 @@
+{
+  "mcpServers": {
+    "shipment-visibility-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh SHIPMENT_VISIBILITY_DB_URL"]
+    },
+    "dos-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh DOS_DB_URL"]
+    },
+    "sir-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh SIR_DB_URL"]
+    },
+    "mce-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh MCE_DB_URL"]
+    },
+    "milestone-processor-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh MILESTONE_PROCESSOR_DB_URL"]
+    },
+    "gis-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh GIS_DB_URL"]
+    },
+    "position-processor-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh POSITION_PROCESSOR_DB_URL"]
+    },
+    "dps-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh DPS_DB_URL"]
+    },
+    "transport-plan-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-intelligence && .claude/mcp/postgres.sh TPP_DB_URL"]
+    },
+    "das-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-sourcing && .claude/mcp/postgres.sh DAS_DB_URL"]
+    },
+    "dpcs-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-sourcing && .claude/mcp/postgres.sh DPCS_DB_URL"]
+    },
+    "dust-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-sourcing && .claude/mcp/postgres.sh DUST_DB_URL"]
+    },
+    "vrdan-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/isce-data-sourcing && .claude/mcp/postgres.sh VRDAN_DB_URL"]
+    },
+    "reference-data-locations-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/on-call/themis-visibility-reference-data-locations && .claude/mcp/postgres.sh REFERENCE_DATA_LOCATIONS_DB_URL"]
+    },
+    "state-manager-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/oncall-debugger/isce-data-sourcing-subscriptionless && .claude/mcp/postgres.sh STATE_MANAGER_DB_URL"]
+    },
+    "reference-data-db": {
+      "command": "sh",
+      "args": ["-c", "cd /Users/daliparthi.meghana/Documents/Repos/oncall-debugger/isce-data-sourcing-subscriptionless && .claude/mcp/postgres.sh REFERENCE_DATA_DB_URL"]
+    }
+  }
+}

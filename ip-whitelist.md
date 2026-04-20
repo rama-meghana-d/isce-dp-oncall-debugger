@@ -1,0 +1,4 @@
+# prod 
+
+themis-data-intelligence-postgresql-server-prod,themis-data-intelligence-postgresql-journey-server-prod,themis-data-intelligence-postgresql-mce-server-prod,isce-data-sourcing-das-postgresql-server-prod,isce-data-sourcing-dpcs-postgresql-server-prod,isce-data-sourcing-dust-postgresql-server-prod,themis-data-intelligence-postgresql-shipment-vis-server-prod,themis-data-postgresql-server-reference-prod,
+themis-data-postgresql-server-reference-prod,isce-data-sourcing-statemanager-postgresql-server-prod,isce-data-sourcing-vrdan-postgresql-server-prod
