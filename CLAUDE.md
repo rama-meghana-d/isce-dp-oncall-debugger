@@ -6,7 +6,27 @@
 
 ## 0. Skills — Slash Commands
 
-Start every unfamiliar incident with `/incident-root-cause-investigator`. Use the sub-skills directly only when you already know the fault category.
+**Start every new ticket with `/triage-ticket`.** It reads the Jira description and comments, extracts the problem statement, and either routes to `/incident-root-cause-investigator` or sends a clarification comment back if the ticket is incomplete.
+
+Use the sub-skills directly only when you already have a clear problem statement and know the fault category.
+
+---
+
+### `/triage-ticket`
+
+**Use when:** You have a Jira ticket key and want to determine whether it's ready for data platform investigation.
+
+**Required input:** `ticket: <JIRA_KEY>`  e.g. `ticket: ISCE-14280`
+
+**Exact steps:**
+1. Fetch the ticket (description, status, assignee) via Atlassian MCP.
+2. Fetch the last 5 comments ordered newest-first. Comments may refine or correct the description — always prefer the most recent information.
+3. Extract `container`, `expected`, `actual`, `subscription_id`, `journey_id` from description + comments combined. Mark each FOUND / MISSING.
+4. Classify issue category: `TRANSPORT_PLAN | VESSEL_VOYAGE | TIMESTAMP | MILESTONE | STITCHING | UNCLEAR`.
+5. **If all three required fields found and category is not UNCLEAR** → invoke `/incident-root-cause-investigator` with the resolved identifiers.
+6. **If any required field is missing or category is UNCLEAR** → post a clarification comment on the Jira ticket listing exactly what's missing, then reassign to reporter.
+
+**Output:** Triage summary table (field extraction) + routing decision or confirmation that clarification comment was posted.
 
 ---
 
