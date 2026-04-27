@@ -64,7 +64,9 @@ Use the sub-skills directly only when you already have a clear problem statement
 - Read the incident `actual` description and the DOS/DFS findings. Match keywords to route:
   - *"transport plan / legs / route / missing leg / extra leg / wrong port / booking / reconciliation"* → invoke `/transport-plan-investigation` with `journey_id`, `container`, `job_id` (if known)
   - *"vessel name / voyage number / wrong vessel / wrong voyage"* → invoke `/vessel-event-investigation` with `problem: vessel_voyage`
-  - *"ETA / ETD / ATA / ATD / timestamp wrong / arrival date / departure date"* → invoke `/vessel-event-investigation` with `problem: timestamp`
+  - *"ETA / ETD / ATA / ATD / timestamp wrong / arrival date / departure date"* — choose based on available detail:
+    - Leg sequence, vessel name, voyage number, and location are all known → invoke `/vessel-event-investigation` with `problem: timestamp`
+    - ETD stale / ATD not received / estimated timestamp not updating / bulk containers / leg/vessel unknown → invoke `/vessel-timestamp-debug`
   - *"milestone / missing event / triangulation / wrong location"* → Milestone investigation (not yet a skill — follow §4: DOS → GIS → MCE → MP → DUST chain)
   - *"stitching / duplicate journey / container merge / split shipment"* → Stitching investigation (not yet a skill — check SIR subscription split events)
 - Pass all resolved identifiers (`journey_id`, `container`, `subscription_id`, `job_id` if known) into the sub-skill invocation.
@@ -135,6 +137,25 @@ Use the sub-skills directly only when you already have a clear problem statement
 
 ---
 
+---
+
+### `/vessel-timestamp-debug`
+
+**Use when:** An ETD is stale (in the past but not updated), ATD has not been received, or estimated/actual timestamps are missing or incorrect and you do not yet know the specific leg, vessel name, or voyage number. Also use for bulk container checks.
+
+**Required input:** `container`. Optional: `journey_id`, `location_code`, `expected_timestamp`, `event_type` (ETD/ATD/ETA/ATA/ALL).
+
+**What it does — in order:**
+1. **Step 1 — Resolve journey_id** from SIR if not provided.
+2. **Step 2 — Check SV port call timestamps** — fetches all committed (`timestamp`) and pending (`pending_timestamp`) values across all legs for the journey.
+3. **Step 3 — Evaluate SV state:**
+   - **Correct** → DFS guardrail check → no platform fault, or DFS dropped the message.
+   - **Pending only** → pending timestamp exists but hasn't been promoted → manual SV UI update required.
+   - **Missing/wrong** → traces DOS IJ → Milestone Processor `enriched_data` → DUST `milestonepipeline` → identifies whether provider hasn't sent the event, sent the wrong value, or whether the issue is in an intermediate processing layer.
+4. **Output:** Layer-by-layer RCA report with culprit and recommended action.
+
+---
+
 **Adding a new sub-skill:** Create `.claude/commands/<name>.md` → add one entry to this section → add one row to the Phase E routing table in `incident-root-cause-investigator.md`.
 
 ---
@@ -169,7 +190,7 @@ inputrequest → dpupdatehandler → dust.topic
 
 **Step 0 — Resolve journey_id:**
 ```sql
--- mcp__sir-db__query
+-- mcp__isce-di-db__query  db: sir
 SELECT journey_id, unit_of_tracking::text, subscription_id, status, created_on
 FROM subscription
 WHERE unit_of_tracking::text LIKE '%<CONTAINER_OR_BL>%'
@@ -178,7 +199,7 @@ ORDER BY created_on DESC;
 
 **Step 0b — Resolve job_id:**
 ```sql
--- mcp__das-db__query
+-- mcp__isce-ds-db__query  db: das
 SELECT job_id, dp_name, gathering_status, publishing_status, tracking_status, created_at
 FROM das_request_store
 WHERE identifiers::text LIKE '%<CONTAINER_OR_BL>%'
@@ -191,22 +212,26 @@ ORDER BY created_at DESC;
 
 All tools are read-only (BEGIN TRANSACTION READ ONLY). Use `ToolSearch select:<name>` before first use.
 
-| MCP Tool | Service | Key Tables |
-|---|---|---|
-| `mcp__das-db__query` | DAS-KC / DAS-Jobs | `das_request_store` |
-| `mcp__dpcs-db__query` | DPCS | `carrier`, `data_provider`, `data_provider_carrier` |
-| `mcp__dust-db__query` | DUST | `milestonepipeline`, `positionpipeline`, `transportplanpipeline` |
-| `mcp__vrdan-db__query` | VRDAN | `versioned_payload_data` |
-| `mcp__sir-db__query` | SIR | `subscription`, `subscription_job_tracking` |
-| `mcp__milestone-processor-db__query` | MP | `milestone`, `subscription_milestone_metadata` |
-| `mcp__mce-db__query` | MCE | `isce_triangulation_audit`, `isce_triangulation_shadow` |
-| `mcp__dos-db__query` | DOS | `intelligent_journey`, `shipment_journey`, `milestone_failed_event` |
-| `mcp__gis-db__query` | GIS | `audit_trail`, `shipment_journey_transaction` |
-| `mcp__transport-plan-db__query` | TPP | `journey`, `journey_reconciliation_updates`, `journey_updates` |
-| `mcp__shipment-visibility-db__query` | Shipment Visibility | `container`, `journey`, `transport_leg` |
-| `mcp__reference-data-locations-db__query` | Reference Data | `unloc_details`, `map_rkst_unloc`, `isce_alt_codes` |
-| `mcp__dps-db__query` | DPS | `rules_store` |
-| `mcp__position-processor-db__query` | Position Processor | `position_detail` |
+Two MCP servers, each exposing a single `query({ db, sql })` tool. Pass `db` as the short name from the table below.
+
+| MCP Tool | `db` value | Service | Key Tables |
+|---|---|---|---|
+| `mcp__isce-di-db__query` | `dos` | DOS | `intelligent_journey`, `shipment_journey`, `milestone_failed_event` |
+| `mcp__isce-di-db__query` | `sir` | SIR | `subscription`, `subscription_job_tracking` |
+| `mcp__isce-di-db__query` | `mce` | MCE | `isce_triangulation_audit`, `isce_triangulation_shadow` |
+| `mcp__isce-di-db__query` | `milestone-processor` | MP | `milestone`, `subscription_milestone_metadata` |
+| `mcp__isce-di-db__query` | `gis` | GIS | `audit_trail`, `shipment_journey_transaction` |
+| `mcp__isce-di-db__query` | `tpp` | TPP | `journey`, `journey_reconciliation_updates`, `journey_updates` |
+| `mcp__isce-di-db__query` | `shipment-visibility` | Shipment Visibility | `container`, `journey`, `transport_leg` |
+| `mcp__isce-di-db__query` | `dps` | DPS | `rules_store` |
+| `mcp__isce-di-db__query` | `position-processor` | Position Processor | `position_detail` |
+| `mcp__isce-ds-db__query` | `das` | DAS-KC / DAS-Jobs | `das_request_store` |
+| `mcp__isce-ds-db__query` | `dpcs` | DPCS | `carrier`, `data_provider`, `data_provider_carrier` |
+| `mcp__isce-ds-db__query` | `dust` | DUST | `milestonepipeline`, `positionpipeline`, `transportplanpipeline` |
+| `mcp__isce-ds-db__query` | `vrdan` | VRDAN | `versioned_payload_data` |
+| `mcp__isce-ds-db__query` | `reference-data-locations` | Reference Data | `unloc_details`, `map_rkst_unloc`, `isce_alt_codes` |
+| `mcp__isce-ds-db__query` | `state-manager` | State Manager | `state` |
+| `mcp__isce-ds-db__query` | `reference-data` | Reference Data (subscriptionless) | `themisReferenceDb` tables |
 
 ---
 
@@ -223,6 +248,7 @@ All tools are read-only (BEGIN TRANSACTION READ ONLY). Use `ToolSearch select:<n
 | Event stuck in pipeline (Kafka lag) | RETinA → stuck service pod | Check consumer group lag, then pod readiness | [dust](isce-data-sourcing/dust/CLAUDE.md) (dedup), [dos](isce-data-intelligence/dos/CLAUDE.md) (retry queue) |
 | Journey stuck as TRACKING_STOPPED | DOS → SIR → DAS | `dos-db: intelligent_journey` status + `sir-db: subscription` reason | [tracking-stopped-scheduler](isce-data-intelligence/tracking-stopped-scheduler/CLAUDE.md) |
 | Duplicate milestones | DUST → MP → MCE | `dust-db: milestonepipeline` duplicate entries | [dust](isce-data-sourcing/dust/CLAUDE.md), [mce](isce-data-intelligence/mce/CLAUDE.md) |
+| ETD stale / ATD not received / estimated timestamp not updating | SV → DOS → MP → DUST → DAS | `shipment-visibility-db: vessel_voyage_port_call_timestamp` | `/vessel-timestamp-debug` |
 | Pod crash / restart loop | Pod describe → Liquibase lock | `SELECT locked FROM databasechangeloglock` on affected DB | §5 below |
 
 ---

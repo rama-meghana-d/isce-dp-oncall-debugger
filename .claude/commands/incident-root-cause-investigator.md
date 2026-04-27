@@ -126,7 +126,8 @@ Analyse the incident `actual` description and the DOS/DFS findings. Match agains
 |-------------------|-----------|
 | "transport plan", "legs", "route", "SCP", "booking", "reconciliation", "missing leg", "extra leg", "wrong port" | `/transport-plan-investigation` |
 | "vessel name", "voyage number", "wrong vessel", "wrong voyage", "vessel voyage incorrect" | `/vessel-event-investigation` with `problem: vessel_voyage` |
-| "ETA", "ETD", "ATA", "ATD", "estimated arrival", "actual arrival", "estimated departure", "actual departure", "timestamp wrong" | `/vessel-event-investigation` with `problem: timestamp` |
+| "ETA", "ETD", "ATA", "ATD", "estimated arrival", "actual arrival", "estimated departure", "actual departure", "timestamp wrong" — leg sequence, vessel, and voyage all known | `/vessel-event-investigation` with `problem: timestamp` |
+| "ETD stale", "ATD not received", "estimated timestamp not updating", "ETD in the past", or timestamp issue where leg/vessel/voyage unknown, or bulk containers | `/vessel-timestamp-debug` |
 | "milestone", "event", "triangulation", "missing event", "wrong location" | *Milestone Missing Investigation* — not yet implemented; follow §4 of root CLAUDE.md: DOS → GIS → MCE → MP → DUST chain |
 | "stitching", "container merge", "split shipment", "duplicate journey" | *Stitching Investigation* — not yet implemented; check SIR subscription split events |
 | Unclear / spans multiple categories | Ask: "Is this a transport plan, vessel event, milestone, or stitching issue?" then route accordingly |
