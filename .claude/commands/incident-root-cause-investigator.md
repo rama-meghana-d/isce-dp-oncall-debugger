@@ -16,6 +16,69 @@ $ARGUMENTS
 
 ---
 
+## Phase 0 — DFS Guardrail Pre-check
+
+**This is the first step, always.** If the guardrail is failing, no update reaches Consumer Platform regardless of what internal layers say — stop here and report without digging further.
+
+Load `mcp__dfs-db__query` via ToolSearch.
+
+### Step 0a — Resolve journey_ids to check
+
+**If `journey_id` is provided:** use it directly — one journey to check.
+
+**If `journey_id` is not provided:** load `mcp__dos-db__query` via ToolSearch and query:
+
+```sql
+-- mcp__dos-db__query
+SELECT journey_id, unit_of_tracking, status, updated_on
+FROM intelligent_journey
+WHERE unit_of_tracking = '<CONTAINER>'
+ORDER BY updated_on DESC;
+```
+
+Collect all returned `journey_id` values. Check DFS for each.
+
+### Step 0b — Query DFS for each journey_id
+
+Run both queries **in parallel** for each `journey_id`. Both tables upsert on re-processing, so `updated_at` is the timestamp of the **most recent** evaluation — not just whether a row exists.
+
+```sql
+-- Most recent passed evaluation
+SELECT journey_id, unit_of_tracking, updated_at
+FROM validation_passed_result
+WHERE journey_id = '<JOURNEY_ID>'
+  AND unit_of_tracking = '<CONTAINER>';
+
+-- Most recent failed evaluation + reason
+SELECT journey_id, unit_of_tracking, reason, updated_at
+FROM validation_result
+WHERE journey_id = '<JOURNEY_ID>'
+  AND unit_of_tracking = '<CONTAINER>';
+```
+
+### Step 0c — Determine current guardrail state by comparing timestamps
+
+The **latest `updated_at` across both tables** is the ground truth for whether the most recent update passed or was dropped.
+
+| Scenario | Current state |
+|----------|--------------|
+| Only `validation_passed_result` has a row | Guardrail **passing** — last update reached downstream |
+| Only `validation_result` has a row | Guardrail **failing** — last update was dropped |
+| Both rows exist, `validation_passed_result.updated_at` is **more recent** | Guardrail **passing** — last update reached downstream (earlier failure was resolved) |
+| Both rows exist, `validation_result.updated_at` is **more recent** | Guardrail **failing** — last update was dropped; the pass record is stale |
+| Neither table has a row | DFS has not yet processed this journey — check Kafka consumer lag on `intelligentJourneyTopic` |
+
+### Step 0d — Act on current state
+
+- **Guardrail passing** → proceed to Phase A.
+- **Guardrail failing** → **STOP.** Output:
+  - The `journey_id`, `reason` string, and `updated_at` from `validation_result`
+  - Which of the 9 rules fired (matched from the reason string)
+  - Verdict: *"DFS guardrail dropped the most recent update for this container (as of `<updated_at>`). No update will reach Consumer Platform until this is resolved. Investigate the data quality issue identified by the failing rule before proceeding to internal layers."*
+- **Neither table has a row** → report Kafka consumer lag on `intelligentJourneyTopic` as the likely cause. Stop.
+
+---
+
 ## Phase A — Bind Identifiers
 
 Parse the input above. Extract `container`, `subscription_id`, `journey_id`, `expected`, `actual`.
@@ -60,67 +123,18 @@ Compare `transport_legs` and milestone data in the result against the **expected
 
 ---
 
-## Phase C — Verify DFS Guardrail Layer
-
-DFS is the validation gateway between DOS and Consumer Platform. It consumes from `intelligentJourneyTopic`, runs all enabled rules in order (fail-fast — first failure drops the message), and publishes to `validatedIntelligentJourneyTopic` only if all pass.
-
-### How to check
-
-**REST API** (primary):
-```
-GET http://<dfs-host>/guardRail/journeyId/<JOURNEY_ID>/unitOfTracking/<CONTAINER>
-```
-
-Response comes from two DB tables:
-- `validation_passed_result` — journey passed all rules; message was published downstream
-- `validation_result` — journey failed a rule; `reason` column names the failing rule and why
-
-**Alternatively:** Grafana (`tag: isce`) → DFS service → `validation.failed` / `validation.dropped` counters, or DFS pod logs.
-
----
-
-### The 9 guardrail rules
-
-All rules default to **disabled** in prod — controlled by feature flags. Rules execute in order; the first failure stops processing and drops the message.
-
-| # | Rule | Feature Flag | What it checks |
-|---|------|-------------|----------------|
-| 1 | `MilestoneAfterActualEmptyContainerReturnedRule` | `MILESTONE_AFTER_ACTUAL_EMPTY_CONTAINER_RETURNED_RULE_ENABLED` | Any ACTUAL milestone (except CARRIER_RELEASE) ≥2 days **after** the latest ACTUAL EMPTY_CONTAINER_RETURNED — detects data delays post-return |
-| 2 | `MilestoneBeforeActualEmptyContainerDispatchedRule` | `MILESTONE_BEFORE_ACTUAL_EMPTY_CONTAINER_DISPATCHED_RULE_ENABLED` | Any ACTUAL milestone ≥2 days **before** the earliest ACTUAL EMPTY_CONTAINER_DISPATCHED — detects premature milestones |
-| 3 | `MilestoneLoadedOnVesselBeforeVesselDepartureRule` | `MILESTONE_LOADED_ON_VESSEL_BEFORE_VESSEL_DEPARTURE_RULE_ENABLED` | Latest ACTUAL LOADED_ON_VESSEL ≥2 days **after** earliest ACTUAL VESSEL_DEPARTURE on any leg — impossible loading timeline |
-| 4 | `MilestoneVesselDepartureBeforeVesselArrivalRule` | `MILESTONE_VESSEL_DEPARTURE_BEFORE_VESSEL_ARRIVAL_RULE_ENABLED` | Latest ACTUAL VESSEL_DEPARTURE ≥2 days **after** earliest ACTUAL VESSEL_ARRIVAL on any leg — reversed vessel timeline |
-| 5 | `MilestoneVesselArrivalBeforeUnloadedFromVesselRule` | `MILESTONE_VESSEL_ARRIVAL_BEFORE_UNLOADED_FROM_VESSEL_RULE_ENABLED` | Latest ACTUAL VESSEL_ARRIVAL ≥2 days **after** earliest ACTUAL UNLOADED_FROM_VESSEL on any leg — impossible unload timeline |
-| 6 | `ShipmentDurationRule` | `SHIPMENT_DURATION_RULE_ENABLED` | Journey duration (first to last ACTUAL milestone) exceeds 9 months — unreasonably long journey |
-| 7 | `OceanLegSameLocationRule` | `OCEAN_LEG_SAME_LOCATION_RULE_ENABLED` | Any ocean leg has identical start and end locations — illogical routing |
-| 8 | `InvalidCircularRouteRule` | `INVALID_CIRCULAR_ROUTE_RULE_ENABLED` | Journey contains a circular pattern A→B, B→A, A→B across 3+ consecutive legs — routing loop |
-| 9 | `MultiplePolPodValidationRule` | `MULTIPLE_POL_POD_VALIDATION_RULE_ENABLED` | Journey has >1 distinct Port of Loading OR >1 distinct Port of Discharge — multiple origins or destinations |
-
-> Rules 1–5 check **ACTUAL events only** with a **2-day grace period** (≥2 days triggers failure, not exact ordering).
-
----
-
-### Decision
-
-| DFS Result | Interpretation |
-|-----------|----------------|
-| `validation_passed_result` row exists — message published | Proceed to Phase D verdict |
-| `validation_result` row exists — message dropped | Data platform dropped the message at DFS. Read `reason` to identify the failing rule. Determine: is this a legitimate data quality issue (valid drop) or a false positive (DFS bug / disabled rule should have been off)? This is a platform finding regardless. |
-| Neither table has a row | DFS has not processed this journey yet — check Kafka consumer lag on `intelligentJourneyTopic` |
-
----
-
-## Phase D — Verdict Gate
+## Phase C — Verdict Gate
 
 | Condition | Verdict |
 |-----------|---------|
-| DOS output correct AND DFS guardrails all passed AND message published downstream | **Data platform is correct.** Output the evidence (query results). Declare no platform fault. Recommend upstream investigation (SCP / CP / provider). |
-| DOS output incorrect OR DFS dropped or failed | **Data platform issue detected.** Proceed to Phase E to classify and route. |
+| DOS output matches expected | **Data platform is correct.** Output the evidence (query results). Declare no platform fault. Recommend upstream investigation (SCP / CP / provider). |
+| DOS output does NOT match expected | **Platform issue at DOS or upstream.** Proceed to Phase D to classify and route. |
 
 ---
 
-## Phase E — Issue Classification and Sub-Skill Routing
+## Phase D — Issue Classification and Sub-Skill Routing
 
-Analyse the incident `actual` description and the DOS/DFS findings. Match against the table below and invoke the corresponding sub-skill.
+Analyse the incident `actual` description and the DOS findings. Match against the table below and invoke the corresponding sub-skill.
 
 | Keywords / Symptom | Sub-Skill |
 |-------------------|-----------|
@@ -128,7 +142,8 @@ Analyse the incident `actual` description and the DOS/DFS findings. Match agains
 | "vessel name", "voyage number", "wrong vessel", "wrong voyage", "vessel voyage incorrect" | `/vessel-event-investigation` with `problem: vessel_voyage` |
 | "ETA", "ETD", "ATA", "ATD", "estimated arrival", "actual arrival", "estimated departure", "actual departure", "timestamp wrong" — leg sequence, vessel, and voyage all known | `/vessel-event-investigation` with `problem: timestamp` |
 | "ETD stale", "ATD not received", "estimated timestamp not updating", "ETD in the past", or timestamp issue where leg/vessel/voyage unknown, or bulk containers | `/vessel-timestamp-debug` |
-| "milestone", "event", "triangulation", "missing event", "wrong location" | *Milestone Missing Investigation* — not yet implemented; follow §4 of root CLAUDE.md: DOS → GIS → MCE → MP → DUST chain |
+| "milestone", "missing event", "triangulation", "wrong location" | `/incorrect-milestone-tracer` with `incorrect_trigger`, `event_timing`, `location_code` |
+| "wrong event type", "incorrect trigger", "vessel arrival at inland", "truck arrival mapped as vessel" | `/incorrect-milestone-tracer` with `incorrect_trigger`, `event_timing`, `location_code` |
 | "stitching", "container merge", "split shipment", "duplicate journey" | *Stitching Investigation* — not yet implemented; check SIR subscription split events |
 | Unclear / spans multiple categories | Ask: "Is this a transport plan, vessel event, milestone, or stitching issue?" then route accordingly |
 
@@ -147,7 +162,7 @@ Output the classification verdict and the sub-skill invocation with the resolved
 
 To add a new investigation sub-skill:
 1. Create `.claude/commands/<new-skill-name>.md`
-2. Add one row to the Phase E routing table above
+2. Add one row to the Phase D routing table above
 3. Add one row to the §0 Skills table in root `CLAUDE.md`
 
 No other changes to this file are needed.

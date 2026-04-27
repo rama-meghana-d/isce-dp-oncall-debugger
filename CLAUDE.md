@@ -38,6 +38,14 @@ Use the sub-skills directly only when you already have a clear problem statement
 
 **Exact steps:**
 
+**Phase 0 — DFS guardrail pre-check (always first)**
+- If `journey_id` provided → query `mcp__dfs-db__query` `validation_passed_result` and `validation_result` for that journey + container.
+- If `journey_id` not provided → query DOS `intelligent_journey` WHERE `unit_of_tracking = container` → collect all `journey_id` values → check DFS for each.
+- Fetch the latest row from both `validation_passed_result` and `validation_result` for each journey + container. Compare `updated_at` — the **most recent timestamp across both tables** is the current state.
+- **`validation_result.updated_at` is more recent (or only that row exists)** → STOP. Guardrail is dropping the latest update. Report the failing rule, `reason`, and `updated_at`. No update reaches Consumer Platform — do not proceed to internal layers.
+- **Neither table has a row** → DFS not yet processed; check Kafka consumer lag on `intelligentJourneyTopic`. Stop.
+- **`validation_passed_result.updated_at` is more recent (or only that row exists)** → guardrail passing; latest update reached downstream. Proceed to Phase A.
+
 **Phase A — Bind identifiers**
 - If `journey_id` is provided → use it directly, skip DB query.
 - If `journey_id` is missing → query SIR `subscription` WHERE `subscription_id = X AND unit_of_tracking LIKE '%container%'` → pick the most recent row → extract `journey_id`.
@@ -48,26 +56,18 @@ Use the sub-skills directly only when you already have a clear problem statement
 - Query DOS `milestone_failed_event` WHERE `journey_id` → check for any events that failed processing and landed in the DLQ.
 - Manually compare `transport_legs` content and milestone records against the `expected` description from your input. Decide: does DOS output match what should have happened?
 
-**Phase C — Check DFS guardrail layer**
-- Call `GET /guardRail/journeyId/{journey_id}/unitOfTracking/{container}`.
-- The response maps to one of three states:
-  - **`validation_passed_result` row exists** → all 9 rules passed; message was published to `validatedIntelligentJourneyTopic`.
-  - **`validation_result` row exists** → a rule failed; message was dropped. Read `reason` to see which of the 9 rules fired and the exact reason string (e.g. "Latest ACTUAL VESSEL_DEPARTURE is after(relaxed by 2 days) earliest ACTUAL VESSEL_ARRIVAL, Leg info: CNSHA DEHAM").
-  - **Neither table has a row** → DFS has not processed this journey yet; check Kafka consumer lag on `intelligentJourneyTopic`.
+**Phase C — Verdict**
+- **DOS output matches expected** → Data platform is correct. Output the `intelligent_journey` row as evidence. Declare no platform fault. Recommend investigation at CP / SCP / provider layer.
+- **DOS output does NOT match expected** → Platform issue at DOS or upstream. Proceed to Phase D.
 
-**Phase D — Verdict**
-- **DOS output matches expected AND DFS `validation_passed_result` exists** → Data platform is correct. Output the `intelligent_journey` row and DFS result as evidence. Declare no platform fault. Recommend investigation at CP / SCP / provider layer.
-- **DOS output does NOT match expected** → Platform issue at DOS or upstream. Proceed to Phase E.
-- **DFS `validation_result` exists (rule fired, message dropped)** → Platform dropped the message. Determine if the rule fired correctly (legitimate data quality issue) or is a false positive. Either way this is a platform finding. Proceed to Phase E.
-
-**Phase E — Classify and route to sub-skill**
+**Phase D — Classify and route to sub-skill**
 - Read the incident `actual` description and the DOS/DFS findings. Match keywords to route:
   - *"transport plan / legs / route / missing leg / extra leg / wrong port / booking / reconciliation"* → invoke `/transport-plan-investigation` with `journey_id`, `container`, `job_id` (if known)
   - *"vessel name / voyage number / wrong vessel / wrong voyage"* → invoke `/vessel-event-investigation` with `problem: vessel_voyage`
   - *"ETA / ETD / ATA / ATD / timestamp wrong / arrival date / departure date"* — choose based on available detail:
     - Leg sequence, vessel name, voyage number, and location are all known → invoke `/vessel-event-investigation` with `problem: timestamp`
     - ETD stale / ATD not received / estimated timestamp not updating / bulk containers / leg/vessel unknown → invoke `/vessel-timestamp-debug`
-  - *"milestone / missing event / triangulation / wrong location"* → Milestone investigation (not yet a skill — follow §4: DOS → GIS → MCE → MP → DUST chain)
+  - *"milestone / missing event / triangulation / wrong location / wrong event type / incorrect trigger / vessel arrival at inland"* → invoke `/incorrect-milestone-tracer` with `incorrect_trigger`, `event_timing`, `location_code`
   - *"stitching / duplicate journey / container merge / split shipment"* → Stitching investigation (not yet a skill — check SIR subscription split events)
 - Pass all resolved identifiers (`journey_id`, `container`, `subscription_id`, `job_id` if known) into the sub-skill invocation.
 
@@ -156,6 +156,24 @@ Use the sub-skills directly only when you already have a clear problem statement
 
 ---
 
+### `/incorrect-milestone-tracer`
+
+**Use when:** A specific milestone event has the wrong `eventTrigger` or `eventTiming` (e.g. `VESSEL_ARRIVAL` appearing at an inland location that should be `TRUCK_ARRIVAL`). You know the incorrect trigger, timing, and UNLOC.
+
+**Required input:** `container`, `incorrect_trigger`, `event_timing`, `location_code`. Optional: `journey_id`.
+
+**What it does — in order:**
+1. **Step 1** — Resolves `journey_id` from SIR if not provided.
+2. **Step 2** — Checks DOS `intelligent_journey`: searches the IJ JSON for the incorrect trigger+timing+location using a compact Python parse script. If absent → GIS/MCE rejection upstream.
+3. **Step 3** — Checks MCE `isce_triangulation_audit` for the same event. If absent → GIS rejected it. If trigger differs from IJ → MCE changed the type (MCE bug).
+4. **Step 4** — Checks MP `milestone` for the same event. If trigger differs → MP enrichment changed the type (MP bug).
+5. **Step 5** — Checks DUST `milestonepipeline` for the container. Extracts `job_id` and `data_provider`. If wrong trigger is present in DUST output → root cause is in DAS transformation layer. If DUST was correct → divergence is in MP/MCE.
+6. **Step 6 (interactive)** — Reports `job_id` + `data_provider`, asks user to supply the raw VRDAN payload, reads the DAS transformer for that provider, cross-references the payload field to the static mapping, and declares: **DI Engineering transformation bug** or **data provider data quality issue**.
+
+**Output:** Layer-by-layer divergence trace with the exact layer where the wrong trigger was introduced, culprit, and recommended action.
+
+---
+
 **Adding a new sub-skill:** Create `.claude/commands/<name>.md` → add one entry to this section → add one row to the Phase E routing table in `incident-root-cause-investigator.md`.
 
 ---
@@ -224,6 +242,7 @@ Two MCP servers, each exposing a single `query({ db, sql })` tool. Pass `db` as 
 | `mcp__isce-di-db__query` | `tpp` | TPP | `journey`, `journey_reconciliation_updates`, `journey_updates` |
 | `mcp__isce-di-db__query` | `shipment-visibility` | Shipment Visibility | `container`, `journey`, `transport_leg` |
 | `mcp__isce-di-db__query` | `dps` | DPS | `rules_store` |
+| `mcp__dfs-db__query` | — | DFS | `validation_result`, `validation_passed_result` |
 | `mcp__isce-di-db__query` | `position-processor` | Position Processor | `position_detail` |
 | `mcp__isce-ds-db__query` | `das` | DAS-KC / DAS-Jobs | `das_request_store` |
 | `mcp__isce-ds-db__query` | `dpcs` | DPCS | `carrier`, `data_provider`, `data_provider_carrier` |
