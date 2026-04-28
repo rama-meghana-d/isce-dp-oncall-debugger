@@ -1,72 +1,72 @@
 #!/usr/bin/env python3
 """
-Compare normalized GIS events against DOS transport plan legs.
+Simulate the DOS ClusteredShipmentJourneyUtility stitching algorithm.
 
-Scores every candidate leg for each event and explains why the currently
-stitched leg was likely selected (or why it looks wrong).
+Takes MCE cluster data + DOS transport plan legs and runs the same 7-priority
+stitching logic to explain why each cluster was assigned to its leg.
+Optionally cross-checks against GIS journey_request to detect discrepancies.
 
 Usage:
   python3 compare_event_to_transport_plan.py \
-    --event <gis_events.json> \
+    --clusters <mce_clusters.json> \
     --transport-plan <dos_tp.json> \
-    [--mce-cluster <mce_cluster.json>]
+    [--gis-events <gis_events.json>]
 
-Input files are outputs from the other parse scripts in this folder.
-Output: compact JSON with per-event scoring, best candidate, explanation, and warnings.
+Input files:
+  --clusters        Output of parse_mce_cluster_output.py
+  --transport-plan  Output of parse_dos_transport_plan.py
+  --gis-events      Output of parse_gis_shipment_journey_transaction.py (optional)
+
+Output: per-cluster JSON with stitchingPhase, simulatedLeg, phaseReason, gisLeg, discrepancy.
 """
 import json
-import sys
 import argparse
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# Trigger classification
+# Trigger classification (from EventTriggerConstants.java)
 # ---------------------------------------------------------------------------
 
-DEPARTURE_TRIGGERS = {
-    "VESSEL_DEPARTURE", "LOAD_ON_VESSEL", "GATE_OUT_EMPTY",
-    "ROAD_DEPARTURE", "RAIL_DEPARTURE", "BARGE_DEPARTURE",
-    "INLAND_PASSAGE", "CUSTOMS_DEPARTURE", "STUFFED",
+# START triggers when enable_gate_in_gate_out_reversal is DISABLED (default)
+START_TRIGGERS_DEFAULT = {
+    "GATE_IN",
+    "EMPTY_CONTAINER_DISPATCHED",
+    "ARRIVED_AT_CUSTOMER_LOCATION",
+    "RECEIVED_AT_AIRPORT",
+    "LOADED_ON_VESSEL", "LOADED_ON_RAIL", "LOADED_ON_BARGE",
+    "VESSEL_DEPARTURE", "TRUCK_DEPARTURE",
+    "RAIL_DEPARTURE_FROM_ORIGIN_INTERMODAL_RAMP",
+    "BARGE_DEPARTURE", "FLIGHT_DEPARTURE",
+    "BOOKED_ON_FLIGHT", "MANIFEST_COMPLETED_AT_AIRPORT", "RECEIVED_FROM_SHIPPER",
+    "EXPORT_CUSTOMS_CLEARED", "STUFFING", "DEPARTURE", "LOADED",
 }
 
-ARRIVAL_TRIGGERS = {
-    "VESSEL_ARRIVAL", "UNLOADED_FROM_VESSEL", "GATE_IN",
-    "ROAD_ARRIVAL", "RAIL_ARRIVAL", "BARGE_ARRIVAL",
-    "CUSTOMS_ARRIVAL", "STRIPPED",
+# END triggers when enable_gate_in_gate_out_reversal is DISABLED (default)
+END_TRIGGERS_DEFAULT = {
+    "VESSEL_ARRIVAL", "TRUCK_ARRIVAL",
+    "RAIL_ARRIVAL_AT_DESTINATION_INTERMODAL_RAMP",
+    "BARGE_ARRIVAL", "FLIGHT_ARRIVAL",
+    "UNLOADED_FROM_VESSEL", "UNLOADED_FROM_A_RAIL_CAR", "UNLOADED_FROM_BARGE",
+    "CARRIER_RELEASE",
+    "GATE_OUT", "EXIT_FACILITY", "GATE_OUT_FROM_AIRPORT",
+    "DELIVERY",
+    "EMPTY_CONTAINER_RETURNED", "DELIVERY_CONFIRMED",
+    "IN_TRANSIT_CUSTOMS_CLEARANCE_OPENED",
+    "IN_TRANSIT_CUSTOMS_CLEARANCE_CLOSED",
+    "IN_TRANSIT_CUSTOMS_CLEARANCE_EXPIRY",
+    "IMPORT_CUSTOMS_ON_HOLD", "IMPORT_CUSTOMS_CLEARED",
+    "RECEIVED_FROM_FLIGHT", "DELIVERED_AT_AIRPORT",
+    "STRIPPING", "ARRIVAL", "UNLOADED",
 }
 
-# Trigger → expected transport modes
-MODE_MAP = {
-    "VESSEL_DEPARTURE": {"SEA", "OCEAN", "VESSEL"},
-    "VESSEL_ARRIVAL": {"SEA", "OCEAN", "VESSEL"},
-    "LOAD_ON_VESSEL": {"SEA", "OCEAN", "VESSEL"},
-    "UNLOADED_FROM_VESSEL": {"SEA", "OCEAN", "VESSEL"},
-    "RAIL_DEPARTURE": {"RAIL", "RAIL_ROAD"},
-    "RAIL_ARRIVAL": {"RAIL", "RAIL_ROAD"},
-    "BARGE_DEPARTURE": {"BARGE", "INLAND_WATERWAY"},
-    "BARGE_ARRIVAL": {"BARGE", "INLAND_WATERWAY"},
-    "ROAD_DEPARTURE": {"ROAD", "TRUCK"},
-    "ROAD_ARRIVAL": {"ROAD", "TRUCK"},
-    "GATE_OUT_EMPTY": {"ROAD", "TRUCK", "SEA", "OCEAN"},
-    "GATE_IN": {"ROAD", "TRUCK", "SEA", "OCEAN"},
-}
+# Terminal milestones without location → last ocean leg (Priority 2)
+TERMINAL_WITHOUT_LOCATION = {"CARRIER_RELEASE", "IMPORT_CUSTOMS_CLEARED", "PICKUP_APPOINTMENT"}
 
-# ---------------------------------------------------------------------------
-# Scoring weights
-# ---------------------------------------------------------------------------
+# Vessel events → restricted to OCEAN legs in circular resolution
+VESSEL_EVENTS = {"LOADED_ON_VESSEL", "VESSEL_DEPARTURE", "VESSEL_ARRIVAL", "UNLOADED_FROM_VESSEL"}
 
-SCORE_ORIGIN_LOCATION_MATCH = 10
-SCORE_DESTINATION_LOCATION_MATCH = 10
-SCORE_TRIGGER_SIDE_CORRECT = 8
-SCORE_TIMESTAMP_WITHIN_WINDOW = 8
-SCORE_MODE_MATCH = 6
-SCORE_VESSEL_MATCH = 6
-SCORE_VOYAGE_MATCH = 4
-PENALTY_SELF_LOOP = -5
-PENALTY_WRONG_TRIGGER_SIDE = -3
+OCEAN_MODES = {"OCEAN", "SEA", "VESSEL"}
 
-TIMESTAMP_WINDOW_DAYS = 2
-TIMESTAMP_ANOMALY_DAYS = 7
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,9 +74,9 @@ TIMESTAMP_ANOMALY_DAYS = 7
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--event", required=True, help="GIS events JSON file (from parse_gis_shipment_journey_transaction.py)")
-    p.add_argument("--transport-plan", required=True, help="DOS transport plan JSON file (from parse_dos_transport_plan.py)")
-    p.add_argument("--mce-cluster", help="MCE cluster JSON file (from parse_mce_cluster_output.py) — optional")
+    p.add_argument("--clusters", required=True, help="MCE clusters JSON (from parse_mce_cluster_output.py)")
+    p.add_argument("--transport-plan", required=True, help="DOS transport plan JSON (from parse_dos_transport_plan.py)")
+    p.add_argument("--gis-events", help="GIS events JSON (from parse_gis_shipment_journey_transaction.py) — optional")
     return p.parse_args()
 
 
@@ -85,10 +85,43 @@ def load_json(path):
         return json.load(f)
 
 
+def is_ocean(leg):
+    mode = (leg.get("mode") or "").upper()
+    return mode in OCEAN_MODES
+
+
+def locations_match(cluster_loc, leg_loc):
+    """Simple UNLOC equality. Both may be None."""
+    if not cluster_loc or not leg_loc:
+        return False
+    return cluster_loc.strip().upper() == leg_loc.strip().upper()
+
+
+def find_duplicate_locations(legs):
+    """
+    Find UNLOC codes that appear as a start or end of more than one leg.
+    Returns (duplicate_starts: set, duplicate_ends: set).
+    Mirrors ClusteredShipmentJourneyUtility.findDuplicateLocations().
+    """
+    start_count = {}
+    end_count = {}
+    for leg in legs:
+        s = (leg.get("fromLocation") or "").strip().upper()
+        e = (leg.get("toLocation") or "").strip().upper()
+        if s:
+            start_count[s] = start_count.get(s, 0) + 1
+        if e:
+            end_count[e] = end_count.get(e, 0) + 1
+    dup_starts = {loc for loc, cnt in start_count.items() if cnt > 1}
+    dup_ends = {loc for loc, cnt in end_count.items() if cnt > 1}
+    return dup_starts, dup_ends
+
+
 def parse_ts(ts_str):
     if not ts_str:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(ts_str[:26], fmt[:len(ts_str)])
             return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
@@ -97,279 +130,481 @@ def parse_ts(ts_str):
     return None
 
 
-def days_between(ts1, ts2):
-    """Return absolute day difference, or None if either is unparseable."""
+def ts_diff_days(ts1, ts2):
     d1, d2 = parse_ts(ts1), parse_ts(ts2)
     if d1 and d2:
         return abs((d1 - d2).total_seconds() / 86400)
     return None
 
 
-def trigger_side(trigger):
-    if trigger in DEPARTURE_TRIGGERS:
-        return "ORIGIN"
-    if trigger in ARRIVAL_TRIGGERS:
-        return "DESTINATION"
-    return "EITHER"
+def best_leg_timestamp(leg, side):
+    """Get the most relevant leg timestamp for proximity comparison."""
+    if side == "start":
+        return leg.get("actualDeparture") or leg.get("estimatedDeparture") or leg.get("plannedDeparture")
+    elif side == "end":
+        return leg.get("actualArrival") or leg.get("estimatedArrival") or leg.get("plannedArrival")
+    return leg.get("plannedDeparture") or leg.get("plannedArrival")
 
 
-def mode_compatible(trigger, leg_mode):
-    if not leg_mode or not trigger:
-        return None
-    expected = MODE_MAP.get(trigger)
-    if not expected:
-        return None
-    return leg_mode.upper() in expected
+def sequence_proximity(cluster_seq, leg_clusters):
+    """Distance between cluster sequence and the closest cluster already on a leg."""
+    if not leg_clusters:
+        return float("inf")
+    return min(abs(cluster_seq - c.get("clusterSequenceNumber", 0)) for c in leg_clusters)
 
 
 # ---------------------------------------------------------------------------
-# Per-leg scoring
+# Priority algorithm (mirrors ClusteredShipmentJourneyUtility)
 # ---------------------------------------------------------------------------
 
-def score_leg(event, leg):
-    score = 0
-    reasons = []
-    warnings = []
+def simulate_stitching(clusters, legs):
+    """
+    Run the 7-priority DOS stitching algorithm on clusters + legs.
+    Returns list of cluster result dicts with simulatedLeg and stitchingPhase.
+    """
+    if not legs:
+        return [
+            {**c, "simulatedLeg": None, "stitchingPhase": "NO_LEGS",
+             "phaseReason": "No transport plan legs available"}
+            for c in clusters
+        ]
 
-    trigger = event.get("eventTrigger") or ""
-    ev_loc = event.get("eventLocationCode")
-    ev_ts = event.get("eventTimestamp")
-    ev_vessel = event.get("vesselName")
-    ev_voyage = event.get("voyage")
-    ev_mode = event.get("mode")
+    sorted_legs = sorted(legs, key=lambda l: l.get("legSequence") or 0)
+    first_leg = sorted_legs[0]
+    last_leg = sorted_legs[-1]
+    ocean_legs = [l for l in sorted_legs if is_ocean(l)]
+    last_ocean_leg = ocean_legs[-1] if ocean_legs else None
 
-    leg_from = leg.get("fromLocation")
-    leg_to = leg.get("toLocation")
-    leg_mode = leg.get("mode")
-    leg_vessel = leg.get("vesselName")
-    leg_voyage = leg.get("voyage")
-    leg_seq = leg.get("legSequence")
-    is_self_loop = leg.get("isSelfLoopLeg", False)
+    dup_starts, dup_ends = find_duplicate_locations(sorted_legs)
 
-    side = trigger_side(trigger)
+    # Track which clusters are assigned to which leg for sequence proximity
+    # leg_seq → list of cluster dicts
+    leg_clusters_map = {l.get("legSequence"): [] for l in sorted_legs}
 
-    # --- Self-loop penalty
-    if is_self_loop:
-        score += PENALTY_SELF_LOOP
-        warnings.append(f"Self-loop leg ({leg_from} → {leg_to}) — stitching here requires justification")
+    results = []
 
-    # --- Location match
-    origin_match = ev_loc and leg_from and ev_loc == leg_from
-    dest_match = ev_loc and leg_to and ev_loc == leg_to
-
-    if origin_match:
-        score += SCORE_ORIGIN_LOCATION_MATCH
-        reasons.append(f"eventLocation {ev_loc} matches leg origin {leg_from}")
-    if dest_match:
-        score += SCORE_DESTINATION_LOCATION_MATCH
-        reasons.append(f"eventLocation {ev_loc} matches leg destination {leg_to}")
-    if ev_loc and not origin_match and not dest_match:
-        warnings.append(f"eventLocation {ev_loc} does not match leg origin ({leg_from}) or destination ({leg_to})")
-
-    # --- Trigger-side compatibility
-    if side == "ORIGIN" and origin_match:
-        score += SCORE_TRIGGER_SIDE_CORRECT
-        reasons.append(f"Departure trigger {trigger} correctly associated with leg origin")
-    elif side == "ORIGIN" and dest_match and not origin_match:
-        score += PENALTY_WRONG_TRIGGER_SIDE
-        warnings.append(f"Departure trigger {trigger} stitched to leg destination (wrong side)")
-    elif side == "DESTINATION" and dest_match:
-        score += SCORE_TRIGGER_SIDE_CORRECT
-        reasons.append(f"Arrival trigger {trigger} correctly associated with leg destination")
-    elif side == "DESTINATION" and origin_match and not dest_match:
-        score += PENALTY_WRONG_TRIGGER_SIDE
-        warnings.append(f"Arrival trigger {trigger} stitched to leg origin (wrong side)")
-
-    # --- Timestamp proximity
-    # Use the most specific available timestamp for the relevant leg side
-    if side == "ORIGIN":
-        leg_ts = leg.get("actualDeparture") or leg.get("estimatedDeparture") or leg.get("plannedDeparture")
-    elif side == "DESTINATION":
-        leg_ts = leg.get("actualArrival") or leg.get("estimatedArrival") or leg.get("plannedArrival")
-    else:
-        leg_ts = leg.get("plannedDeparture") or leg.get("plannedArrival")
-
-    diff_days = days_between(ev_ts, leg_ts)
-    if diff_days is not None:
-        if diff_days <= TIMESTAMP_WINDOW_DAYS:
-            score += SCORE_TIMESTAMP_WITHIN_WINDOW
-            reasons.append(f"Event timestamp within {diff_days:.1f} days of leg scheduled time")
-        elif diff_days <= TIMESTAMP_ANOMALY_DAYS:
-            reasons.append(f"Event timestamp {diff_days:.1f} days from leg scheduled time (outside 2-day window)")
+    # --- Priority 1: Empty container hardwired ---
+    p1_clusters = []
+    remaining = []
+    for cluster in clusters:
+        trigger = cluster.get("eventTrigger") or ""
+        if trigger == "EMPTY_CONTAINER_DISPATCHED":
+            p1_clusters.append({
+                **cluster,
+                "simulatedLeg": first_leg.get("legSequence"),
+                "stitchedLegFrom": first_leg.get("fromLocation"),
+                "stitchedLegTo": first_leg.get("toLocation"),
+                "stitchingPhase": "P1",
+                "phaseReason": "EMPTY_CONTAINER_DISPATCHED always stitches to first leg regardless of location",
+                "warnings": [],
+            })
+            leg_clusters_map[first_leg.get("legSequence")].append(cluster)
+        elif trigger == "EMPTY_CONTAINER_RETURNED":
+            p1_clusters.append({
+                **cluster,
+                "simulatedLeg": last_leg.get("legSequence"),
+                "stitchedLegFrom": last_leg.get("fromLocation"),
+                "stitchedLegTo": last_leg.get("toLocation"),
+                "stitchingPhase": "P1",
+                "phaseReason": "EMPTY_CONTAINER_RETURNED always stitches to last leg regardless of location",
+                "warnings": [],
+            })
+            leg_clusters_map[last_leg.get("legSequence")].append(cluster)
         else:
-            warnings.append(f"Event timestamp {diff_days:.1f} days from leg scheduled time (anomaly)")
+            remaining.append(cluster)
 
-    # --- Mode compatibility
-    compat = mode_compatible(trigger, leg_mode)
-    if compat is True:
-        score += SCORE_MODE_MATCH
-        reasons.append(f"Trigger {trigger} is compatible with leg mode {leg_mode}")
-    elif compat is False:
-        warnings.append(f"Trigger {trigger} is NOT compatible with leg mode {leg_mode}")
+    results.extend(p1_clusters)
 
-    # --- Vessel match
-    if ev_vessel and leg_vessel:
-        if ev_vessel.strip().upper() == leg_vessel.strip().upper():
-            score += SCORE_VESSEL_MATCH
-            reasons.append(f"Vessel name matches: {ev_vessel}")
+    # --- Priority 2: Terminal milestones without location → last ocean leg ---
+    p2_clusters = []
+    next_remaining = []
+    for cluster in remaining:
+        trigger = cluster.get("eventTrigger") or ""
+        loc = cluster.get("clusterLocationCode")
+        if trigger in TERMINAL_WITHOUT_LOCATION and not loc:
+            target_leg = last_ocean_leg or last_leg
+            p2_clusters.append({
+                **cluster,
+                "simulatedLeg": target_leg.get("legSequence"),
+                "stitchedLegFrom": target_leg.get("fromLocation"),
+                "stitchedLegTo": target_leg.get("toLocation"),
+                "stitchingPhase": "P2",
+                "phaseReason": (
+                    f"{trigger} has no cluster location → "
+                    f"stitched to last {'ocean ' if last_ocean_leg else ''}leg "
+                    f"(seq {target_leg.get('legSequence')})"
+                ),
+                "warnings": [],
+            })
+            leg_clusters_map[target_leg.get("legSequence")].append(cluster)
         else:
-            warnings.append(f"Vessel mismatch: event={ev_vessel}, leg={leg_vessel}")
+            next_remaining.append(cluster)
 
-    # --- Voyage match
-    if ev_voyage and leg_voyage:
-        if ev_voyage.strip().upper() == leg_voyage.strip().upper():
-            score += SCORE_VOYAGE_MATCH
-            reasons.append(f"Voyage matches: {ev_voyage}")
+    results.extend(p2_clusters)
+    remaining = next_remaining
+
+    # --- Priority 3: Non-duplicate location + matching trigger side ---
+    p3_clusters = []
+    next_remaining = []
+    for cluster in remaining:
+        trigger = cluster.get("eventTrigger") or ""
+        loc = (cluster.get("clusterLocationCode") or "").strip().upper()
+
+        matched_leg = None
+        phase_reason = None
+
+        if trigger in START_TRIGGERS_DEFAULT and loc and loc not in dup_starts:
+            for leg in sorted_legs:
+                leg_from = (leg.get("fromLocation") or "").strip().upper()
+                if loc == leg_from:
+                    matched_leg = leg
+                    phase_reason = (
+                        f"P3: {trigger} is a START trigger; cluster location {loc} "
+                        f"matches leg {leg.get('legSequence')} startLocation {leg.get('fromLocation')} "
+                        f"(unique boundary — not a duplicate start location)"
+                    )
+                    break
+
+        if matched_leg is None and trigger in END_TRIGGERS_DEFAULT and loc and loc not in dup_ends:
+            for leg in sorted_legs:
+                leg_to = (leg.get("toLocation") or "").strip().upper()
+                if loc == leg_to:
+                    matched_leg = leg
+                    phase_reason = (
+                        f"P3: {trigger} is an END trigger; cluster location {loc} "
+                        f"matches leg {leg.get('legSequence')} endLocation {leg.get('toLocation')} "
+                        f"(unique boundary — not a duplicate end location)"
+                    )
+                    break
+
+        if matched_leg:
+            p3_clusters.append({
+                **cluster,
+                "simulatedLeg": matched_leg.get("legSequence"),
+                "stitchedLegFrom": matched_leg.get("fromLocation"),
+                "stitchedLegTo": matched_leg.get("toLocation"),
+                "stitchingPhase": "P3",
+                "phaseReason": phase_reason,
+                "warnings": [],
+            })
+            leg_clusters_map[matched_leg.get("legSequence")].append(cluster)
         else:
-            warnings.append(f"Voyage mismatch: event={ev_voyage}, leg={leg_voyage}")
+            next_remaining.append(cluster)
 
-    return {
-        "legSequence": leg_seq,
-        "from": leg_from,
-        "to": leg_to,
-        "mode": leg_mode,
-        "isSelfLoop": is_self_loop,
-        "score": score,
-        "reasons": reasons,
-        "warnings": warnings,
-    }
+    results.extend(p3_clusters)
+    remaining = next_remaining
 
+    # --- Priority 4: Duplicate location → circular leg resolution ---
+    p4_clusters = []
+    next_remaining = []
+    for cluster in remaining:
+        trigger = cluster.get("eventTrigger") or ""
+        loc = (cluster.get("clusterLocationCode") or "").strip().upper()
+        cluster_seq = cluster.get("clusterSequenceNumber") or 0
+        is_vessel = trigger in VESSEL_EVENTS
 
-def confidence_label(best_score, selected_score, best_is_selected):
-    if best_is_selected and best_score >= 28:
-        return "High"
-    if best_is_selected and best_score >= 14:
-        return "Medium"
-    if not best_is_selected and (best_score - selected_score) >= 10:
-        return "Low"
-    return "Medium"
+        candidate_legs = []
+        side = None
+
+        if trigger in START_TRIGGERS_DEFAULT and loc in dup_starts:
+            candidate_legs = [l for l in sorted_legs
+                              if (l.get("fromLocation") or "").strip().upper() == loc]
+            side = "start"
+        elif trigger in END_TRIGGERS_DEFAULT and loc in dup_ends:
+            candidate_legs = [l for l in sorted_legs
+                              if (l.get("toLocation") or "").strip().upper() == loc]
+            side = "end"
+
+        if not candidate_legs:
+            next_remaining.append(cluster)
+            continue
+
+        # Filter by mode for vessel vs non-vessel (simplified: always restrict vessel to ocean)
+        warnings = []
+        if is_vessel:
+            ocean_candidates = [l for l in candidate_legs if is_ocean(l)]
+            if ocean_candidates:
+                candidate_legs = ocean_candidates
+                warnings.append(f"Vessel cluster {trigger} — restricted to OCEAN legs in duplicate resolution")
+            else:
+                warnings.append(f"Vessel cluster {trigger} — no OCEAN legs among candidates; using all modes")
+
+        # Find best leg by sequence proximity
+        best_leg = None
+        best_reason = None
+
+        # Check if cluster seq falls within range of any candidate leg's existing clusters
+        for leg in sorted_legs:
+            if leg not in candidate_legs:
+                continue
+            leg_seq = leg.get("legSequence")
+            existing = leg_clusters_map.get(leg_seq) or []
+            if existing:
+                min_seq = min(c.get("clusterSequenceNumber", 0) for c in existing)
+                max_seq = max(c.get("clusterSequenceNumber", 0) for c in existing)
+                if min_seq <= cluster_seq <= max_seq:
+                    best_leg = leg
+                    best_reason = (
+                        f"P4: Duplicate location {loc}; cluster sequence {cluster_seq} falls within "
+                        f"range [{min_seq}–{max_seq}] of clusters already on leg {leg_seq}"
+                    )
+                    break
+
+        # Fallback: nearest cluster sequence among candidate legs
+        if best_leg is None:
+            best_proximity = float("inf")
+            for leg in sorted_legs:
+                if leg not in candidate_legs:
+                    continue
+                leg_seq = leg.get("legSequence")
+                existing = leg_clusters_map.get(leg_seq) or []
+                prox = sequence_proximity(cluster_seq, existing)
+                if prox < best_proximity:
+                    best_proximity = prox
+                    best_leg = leg
+                    if existing:
+                        best_reason = (
+                            f"P4: Duplicate location {loc}; cluster sequence {cluster_seq} is "
+                            f"closest (distance {prox:.0f}) to clusters on leg {leg_seq}"
+                        )
+                    else:
+                        best_reason = (
+                            f"P4: Duplicate location {loc}; leg {leg_seq} has no existing clusters — "
+                            f"assigned by timestamp proximity to leg scheduled dates"
+                        )
+
+        if best_leg is None and candidate_legs:
+            # Last resort: use timestamp proximity to leg dates
+            cluster_ts = cluster.get("clusterTimestamp")
+            best_diff = float("inf")
+            for leg in candidate_legs:
+                leg_ts = best_leg_timestamp(leg, side)
+                diff = ts_diff_days(cluster_ts, leg_ts)
+                if diff is not None and diff < best_diff:
+                    best_diff = diff
+                    best_leg = leg
+                    best_reason = (
+                        f"P4: Duplicate location {loc}; assigned to leg {leg.get('legSequence')} "
+                        f"by timestamp proximity ({best_diff:.1f} days from scheduled date)"
+                    )
+
+        if best_leg:
+            p4_clusters.append({
+                **cluster,
+                "simulatedLeg": best_leg.get("legSequence"),
+                "stitchedLegFrom": best_leg.get("fromLocation"),
+                "stitchedLegTo": best_leg.get("toLocation"),
+                "stitchingPhase": "P4",
+                "phaseReason": best_reason,
+                "warnings": warnings,
+            })
+            leg_clusters_map[best_leg.get("legSequence")].append(cluster)
+        else:
+            next_remaining.append(cluster)
+
+    results.extend(p4_clusters)
+    remaining = next_remaining
+
+    # --- Priority 5: Any location fallback ---
+    p5_clusters = []
+    next_remaining = []
+    for cluster in remaining:
+        loc = (cluster.get("clusterLocationCode") or "").strip().upper()
+        matched_leg = None
+        if loc:
+            for leg in sorted_legs:
+                leg_from = (leg.get("fromLocation") or "").strip().upper()
+                leg_to = (leg.get("toLocation") or "").strip().upper()
+                if loc == leg_from or loc == leg_to:
+                    matched_leg = leg
+                    break
+
+        if matched_leg:
+            side_match = "start" if (loc == (matched_leg.get("fromLocation") or "").upper()) else "end"
+            p5_clusters.append({
+                **cluster,
+                "simulatedLeg": matched_leg.get("legSequence"),
+                "stitchedLegFrom": matched_leg.get("fromLocation"),
+                "stitchedLegTo": matched_leg.get("toLocation"),
+                "stitchingPhase": "P5",
+                "phaseReason": (
+                    f"P5: Fallback any-location match; cluster location {loc} matches "
+                    f"leg {matched_leg.get('legSequence')} {side_match}Location "
+                    f"(trigger-side not enforced at this priority)"
+                ),
+                "warnings": [
+                    f"Trigger {cluster.get('eventTrigger')} may be on wrong side — matched by fallback only"
+                ],
+            })
+            leg_clusters_map[matched_leg.get("legSequence")].append(cluster)
+        else:
+            next_remaining.append(cluster)
+
+    results.extend(p5_clusters)
+    remaining = next_remaining
+
+    # --- Priority 6: DELIVERY_CONFIRMED orphan → last leg ---
+    p6_clusters = []
+    next_remaining = []
+    for cluster in remaining:
+        trigger = cluster.get("eventTrigger") or ""
+        if trigger == "DELIVERY_CONFIRMED":
+            p6_clusters.append({
+                **cluster,
+                "simulatedLeg": last_leg.get("legSequence"),
+                "stitchedLegFrom": last_leg.get("fromLocation"),
+                "stitchedLegTo": last_leg.get("toLocation"),
+                "stitchingPhase": "P6",
+                "phaseReason": "P6: DELIVERY_CONFIRMED orphan — no location matched any leg; stitched to last leg",
+                "warnings": ["DELIVERY_CONFIRMED had no location or did not match any leg boundary"],
+            })
+            leg_clusters_map[last_leg.get("legSequence")].append(cluster)
+        else:
+            next_remaining.append(cluster)
+
+    results.extend(p6_clusters)
+    remaining = next_remaining
+
+    # --- Priority 7: True orphan ---
+    for cluster in remaining:
+        loc = cluster.get("clusterLocationCode")
+        trigger = cluster.get("eventTrigger") or ""
+        reason_parts = []
+        if not loc:
+            reason_parts.append("cluster has no location")
+        else:
+            reason_parts.append(f"cluster location {loc} did not match any leg boundary")
+        if trigger not in START_TRIGGERS_DEFAULT and trigger not in END_TRIGGERS_DEFAULT:
+            reason_parts.append(f"trigger {trigger} is not in any start/end trigger list")
+        results.append({
+            **cluster,
+            "simulatedLeg": None,
+            "stitchedLegFrom": None,
+            "stitchedLegTo": None,
+            "stitchingPhase": "P7",
+            "phaseReason": f"P7: True orphan — {'; '.join(reason_parts)}. "
+                           "Cluster appears in CorrelatedShipmentJourney.events (top-level), not on any leg.",
+            "warnings": ["Cluster is orphaned — investigate whether transport plan covers this location"],
+        })
+
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Main comparison logic
+# Cross-check against GIS events
 # ---------------------------------------------------------------------------
 
-def compare_event(event, legs, mce_events_by_trigger_loc):
-    trigger = event.get("eventTrigger") or "UNKNOWN"
-    ev_loc = event.get("eventLocationCode")
-    current_leg_seq = event.get("stitchedLegSequence")
-
-    # Score every leg
-    scores = [score_leg(event, leg) for leg in legs]
-    scores.sort(key=lambda s: s["score"], reverse=True)
-
-    best = scores[0] if scores else None
-    selected = next((s for s in scores if s["legSequence"] == current_leg_seq), None)
-
-    best_is_selected = (
-        best is not None
-        and selected is not None
-        and best["legSequence"] == selected["legSequence"]
-    )
-
-    # Build explanation
-    explanation_parts = []
-    if selected:
-        explanation_parts.append(f"Event ({trigger} @ {ev_loc}) is currently stitched to leg {current_leg_seq} ({selected['from']} → {selected['to']}).")
-        if selected["reasons"]:
-            explanation_parts.append("Supporting signals: " + "; ".join(selected["reasons"]) + ".")
-        if selected["warnings"]:
-            explanation_parts.append("Concerns: " + "; ".join(selected["warnings"]) + ".")
-    else:
-        explanation_parts.append(f"Stitched leg {current_leg_seq} not found in transport plan — leg may be missing or sequence mismatch.")
-
-    if not best_is_selected and best:
-        explanation_parts.append(
-            f"Higher-scoring leg {best['legSequence']} ({best['from']} → {best['to']}) "
-            f"scored {best['score']} vs selected leg score {selected['score'] if selected else 'N/A'}. "
-            f"Possible stitching anomaly."
+def build_gis_index(gis_events):
+    """Index GIS events by (trigger, location) for quick lookup."""
+    idx = {}
+    for ev in gis_events:
+        key = (
+            (ev.get("eventTrigger") or "").upper(),
+            (ev.get("eventLocationCode") or "").upper(),
         )
+        idx[key] = ev
+    return idx
 
-    # MCE context
-    mce_key = f"{trigger}|{ev_loc}"
-    mce_match = mce_events_by_trigger_loc.get(mce_key)
-    if mce_match:
-        mce_leg = mce_match.get("selectedLeg")
-        if mce_leg and str(mce_leg) != str(current_leg_seq):
-            explanation_parts.append(
-                f"MCE cluster selected leg {mce_leg} but GIS stitched to leg {current_leg_seq} — possible GIS persistence issue."
+
+def cross_check(result, gis_index):
+    """Add gisLeg and discrepancy fields by matching cluster trigger+location against GIS."""
+    trigger = (result.get("eventTrigger") or "").upper()
+    loc = (result.get("clusterLocationCode") or "").upper()
+    key = (trigger, loc)
+    gis_ev = gis_index.get(key)
+    if gis_ev:
+        gis_leg = gis_ev.get("stitchedLegSequence")
+        result["gisLeg"] = gis_leg
+        sim_leg = result.get("simulatedLeg")
+        result["discrepancy"] = (
+            sim_leg is not None and gis_leg is not None and str(sim_leg) != str(gis_leg)
+        )
+        if result["discrepancy"]:
+            result["discrepancyNote"] = (
+                f"DOS simulation places cluster on leg {sim_leg} "
+                f"but GIS journey_request shows leg {gis_leg} — possible persistence issue"
             )
-
-    # Assessment
-    if not best_is_selected and best and (best["score"] - (selected["score"] if selected else 0)) >= 10:
-        assessment = "Suspicious"
-    elif selected and selected["warnings"] and selected["score"] < 10:
-        assessment = "Suspicious"
-    elif not selected:
-        assessment = "Incorrect"
     else:
-        assessment = "Correct"
+        result["gisLeg"] = None
+        result["discrepancy"] = False
+    return result
 
-    conf = confidence_label(
-        best["score"] if best else 0,
-        selected["score"] if selected else 0,
-        best_is_selected,
-    )
 
-    return {
-        "eventTrigger": trigger,
-        "eventTiming": event.get("eventTiming"),
-        "eventTimestamp": event.get("eventTimestamp"),
-        "eventLocationCode": ev_loc,
-        "selectedLeg": current_leg_seq,
-        "selectedLegScore": selected["score"] if selected else None,
-        "bestCandidateLeg": best["legSequence"] if best else None,
-        "bestCandidateScore": best["score"] if best else None,
-        "bestIsSelected": best_is_selected,
-        "candidateLegScores": scores,
-        "explanation": " ".join(explanation_parts),
-        "assessment": assessment,
-        "confidence": conf,
-        "mceSelectedLeg": mce_match.get("selectedLeg") if mce_match else None,
-    }
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
 
-    gis_data = load_json(args.event)
+    mce_data = load_json(args.clusters)
     tp_data = load_json(args.transport_plan)
-    mce_data = load_json(args.mce_cluster) if args.mce_cluster else {}
+    gis_data = load_json(args.gis_events) if args.gis_events else {}
 
-    events = gis_data.get("events") or []
+    clusters = mce_data.get("clusters") or []
     legs = tp_data.get("legs") or []
-
-    # Index MCE events by trigger+location for quick lookup
-    mce_events_by_trigger_loc = {}
-    for ev in (mce_data.get("events") or []):
-        key = f"{ev.get('eventTrigger')}|{ev.get('eventLocationCode')}"
-        mce_events_by_trigger_loc[key] = ev
+    gis_events = gis_data.get("events") or []
 
     if not legs:
-        print(json.dumps({"status": "NO_TRANSPORT_PLAN", "message": "No legs found in DOS transport plan"}, indent=2))
+        print(json.dumps({
+            "status": "NO_TRANSPORT_PLAN",
+            "message": "No legs found in DOS transport plan",
+        }, indent=2))
         return
 
-    results = []
-    for event in events:
-        results.append(compare_event(event, legs, mce_events_by_trigger_loc))
+    if not clusters:
+        print(json.dumps({
+            "status": "NO_CLUSTERS",
+            "message": "No clusters found in MCE subscription_data",
+            "storageType": mce_data.get("storageType"),
+        }, indent=2))
+        return
 
-    # Summary
-    suspicious = [r for r in results if r["assessment"] in ("Suspicious", "Incorrect")]
+    results = simulate_stitching(clusters, legs)
+
+    if gis_events:
+        gis_index = build_gis_index(gis_events)
+        results = [cross_check(r, gis_index) for r in results]
+
+    orphans = [r for r in results if r.get("stitchingPhase") == "P7"]
+    discrepancies = [r for r in results if r.get("discrepancy")]
+    p5_fallbacks = [r for r in results if r.get("stitchingPhase") == "P5"]
+    suspicious = orphans + discrepancies + p5_fallbacks
+
+    # De-duplicate suspicious list
+    seen = set()
+    suspicious_deduped = []
+    for r in suspicious:
+        cid = r.get("clusterIdentifier")
+        if cid not in seen:
+            seen.add(cid)
+            suspicious_deduped.append(r)
 
     output = {
         "status": "OK",
-        "journeyId": gis_data.get("journeyId"),
-        "unitOfTracking": gis_data.get("unitOfTracking"),
-        "eventCount": len(results),
-        "suspiciousCount": len(suspicious),
+        "journeyId": mce_data.get("journeyId"),
+        "unitOfTracking": mce_data.get("unitOfTracking"),
+        "clusterCount": len(results),
+        "suspiciousCount": len(suspicious_deduped),
         "results": results,
-        "suspiciousEvents": [
-            {"trigger": r["eventTrigger"], "location": r["eventLocationCode"],
-             "selectedLeg": r["selectedLeg"], "bestCandidateLeg": r["bestCandidateLeg"],
-             "assessment": r["assessment"], "confidence": r["confidence"]}
-            for r in suspicious
+        "suspiciousClusterSummary": [
+            {
+                "clusterIdentifier": r.get("clusterIdentifier"),
+                "clusterTimestamp": r.get("clusterTimestamp"),
+                "clusterLocationCode": r.get("clusterLocationCode"),
+                "clusterSequenceNumber": r.get("clusterSequenceNumber"),
+                "eventTrigger": r.get("eventTrigger"),
+                "stitchingPhase": r.get("stitchingPhase"),
+                "simulatedLeg": r.get("simulatedLeg"),
+                "gisLeg": r.get("gisLeg"),
+                "discrepancy": r.get("discrepancy"),
+                "phaseReason": r.get("phaseReason"),
+                "warnings": r.get("warnings"),
+            }
+            for r in suspicious_deduped
         ],
     }
+
     print(json.dumps(output, indent=2))
 
 

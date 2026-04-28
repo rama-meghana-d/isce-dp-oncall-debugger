@@ -2,8 +2,9 @@
 """
 Parse MCE journey_subscription query result.
 
-Reads the MCP query output (subscription_data JSON column from journey_subscription table)
-and extracts compact event-to-cluster relationships for stitching analysis.
+Traverses subscriptionData → dataProviderData → events → cluster to extract
+JourneyCluster data as DOS sees it. Groups events by clusterIdentifier and assigns
+clusterSequenceNumber by sorting on clusterTimestamp (mirrors ClusteredShipmentJourneyUtility).
 
 Handles both IN_MEMORY (subscription_data present) and BLOB storage cases.
 
@@ -12,18 +13,20 @@ Usage:
     [--trigger VESSEL_DEPARTURE] \
     [--location CNSHA]
 
-Output: compact JSON with storage info, cluster events, and per-event stitching context.
+Output: JSON with per-cluster data including clusterIdentifier, clusterTimestamp,
+        clusterLocationCode, clusterSequenceNumber, eventTrigger, providers, events[].
 """
 import json
 import sys
 import argparse
+from collections import defaultdict
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("file", help="Path to MCP query result JSON file")
-    p.add_argument("--trigger", help="Filter by eventTrigger")
-    p.add_argument("--location", help="Filter by eventLocationCode (LOCODE)")
+    p.add_argument("--trigger", help="Filter clusters by eventTrigger of representative event")
+    p.add_argument("--location", help="Filter clusters by clusterLocationCode (UNLOC)")
     return p.parse_args()
 
 
@@ -54,124 +57,181 @@ def safe_json(val):
         return None
 
 
-def extract_location_code(loc):
-    if not isinstance(loc, dict):
-        return str(loc) if loc else None
-    return (
-        loc.get("UNLocationCode")
-        or loc.get("locationCode")
-        or loc.get("location_code")
-        or loc.get("unLocationCode")
-    )
+def extract_unloc(location_wrapper):
+    """Extract UNLOC code from a LocationWrapper object (mirrors LocationMatchingUtility)."""
+    if not isinstance(location_wrapper, dict):
+        return None
+    location = location_wrapper.get("location") or {}
+    if not isinstance(location, dict):
+        return None
+
+    # Try alternativeCodes for PORT_UN_LOCODE first
+    for alt in (location.get("alternativeCodes") or []):
+        if isinstance(alt, dict) and alt.get("alternativeCodeType") == "PORT_UN_LOCODE":
+            code = alt.get("alternativeCode")
+            if code:
+                return code
+
+    # Then unLocCode directly
+    unloc = location.get("unLocCode") or location.get("UNLocationCode")
+    if unloc:
+        return unloc
+
+    # Then countryCityCode or cityCode
+    return location.get("countryCityCode") or location.get("cityCode") or None
 
 
-def extract_events_from_cluster(cluster, cluster_id, row_meta):
-    """Extract normalized events from a single cluster object."""
-    events = []
-    selected_leg = cluster.get("selectedLeg") or cluster.get("legSequence") or cluster.get("leg_sequence")
-    candidate_legs = cluster.get("candidateLegs") or cluster.get("candidates") or []
-    matched_reason = cluster.get("matchedReason") or cluster.get("reason") or cluster.get("selectionReason")
-    applied_rules = cluster.get("appliedRules") or cluster.get("rules") or []
-    fused_event_id = cluster.get("fusedEventId") or cluster.get("fused_event_id")
+def extract_facility_code(location_wrapper):
+    """Extract facility code from a LocationWrapper."""
+    if not isinstance(location_wrapper, dict):
+        return None
+    facility = location_wrapper.get("facility") or {}
+    if isinstance(facility, dict):
+        return facility.get("facilityCode")
+    return None
 
-    source_events = (
-        cluster.get("events")
-        or cluster.get("sourceEvents")
-        or cluster.get("milestones")
-        or []
-    )
 
-    for ev in source_events:
-        if not isinstance(ev, dict):
-            continue
-        trigger = ev.get("eventTrigger") or ev.get("event_trigger")
-        if not trigger:
-            continue
-
-        loc = ev.get("location") or {}
-        if isinstance(loc, list):
-            loc = loc[0] if loc else {}
-        loc_code = extract_location_code(loc)
-        loc_func = loc.get("locationType") or loc.get("locationFunction") if isinstance(loc, dict) else None
-
-        events.append({
-            "journeyId": row_meta.get("journey_id"),
-            "unitOfTracking": row_meta.get("unit_of_tracking"),
-            "clusterId": cluster_id,
-            "fusedEventId": fused_event_id,
-            "eventIdentifier": ev.get("eventID") or ev.get("id") or ev.get("eventIdentifier"),
-            "eventTrigger": trigger,
-            "eventTiming": ev.get("eventTiming") or ev.get("event_timing"),
-            "eventTimestamp": ev.get("timestamp") or ev.get("eventTimestamp"),
-            "eventLocationCode": loc_code,
-            "eventLocationFunction": loc_func,
-            "provider": ev.get("dataProvider") or ev.get("provider") or ev.get("source"),
-            "jobId": ev.get("jobId") or ev.get("job_id"),
-            "selectedLeg": selected_leg,
-            "candidateLegs": candidate_legs,
-            "matchedReason": matched_reason,
-            "appliedRules": applied_rules[:5] if isinstance(applied_rules, list) else applied_rules,
-        })
-
-    # If no source events but the cluster itself has event fields, treat it as a single event
-    if not events:
-        trigger = cluster.get("eventTrigger") or cluster.get("event_trigger")
-        if trigger:
-            loc = cluster.get("location") or {}
-            loc_code = extract_location_code(loc)
-            events.append({
-                "journeyId": row_meta.get("journey_id"),
-                "unitOfTracking": row_meta.get("unit_of_tracking"),
-                "clusterId": cluster_id,
-                "fusedEventId": fused_event_id,
-                "eventIdentifier": cluster.get("eventID") or cluster.get("id"),
-                "eventTrigger": trigger,
-                "eventTiming": cluster.get("eventTiming"),
-                "eventTimestamp": cluster.get("timestamp"),
-                "eventLocationCode": loc_code,
-                "eventLocationFunction": None,
-                "provider": cluster.get("dataProvider") or cluster.get("provider"),
-                "jobId": cluster.get("jobId"),
-                "selectedLeg": selected_leg,
-                "candidateLegs": candidate_legs,
-                "matchedReason": matched_reason,
-                "appliedRules": applied_rules[:5] if isinstance(applied_rules, list) else applied_rules,
-            })
-
-    return events
+def extract_cluster_location(cluster_locations):
+    """Get the representative location code from a clusterLocations list."""
+    if not cluster_locations or not isinstance(cluster_locations, list):
+        return None, None
+    first = cluster_locations[0] if cluster_locations else {}
+    unloc = extract_unloc(first)
+    facility = extract_facility_code(first)
+    # UNLOC takes priority over facility code (mirrors LocationMatchingUtility priority)
+    return unloc or facility, facility
 
 
 def parse_subscription_data(sub_data, row_meta):
-    """Walk the subscription_data JSON to extract all cluster events."""
-    all_events = []
+    """
+    Walk subscriptionData → dataProviderData → events → cluster.
+    Groups events by clusterIdentifier and returns a cluster map.
+    Returns: dict[int, dict] cluster_id → cluster_info
+    """
+    cluster_map = {}
+
     if not isinstance(sub_data, dict):
-        return all_events
+        return cluster_map
 
-    # Try top-level clusters list
-    for clusters_key in ("clusters", "eventClusters", "milestoneGroups", "groups"):
-        clusters = sub_data.get(clusters_key)
-        if isinstance(clusters, list):
-            for i, cluster in enumerate(clusters):
-                if not isinstance(cluster, dict):
+    # The root field is subscriptionData (aliases: SubscriptionEvents, subscriptionEvents)
+    subscription_data_list = (
+        sub_data.get("subscriptionData")
+        or sub_data.get("SubscriptionEvents")
+        or sub_data.get("subscriptionEvents")
+        or []
+    )
+
+    if not isinstance(subscription_data_list, list):
+        return cluster_map
+
+    for subscription in subscription_data_list:
+        if not isinstance(subscription, dict):
+            continue
+
+        data_provider_data_list = (
+            subscription.get("dataProviderData")
+            or subscription.get("DataProviderEvents")
+            or subscription.get("dataProviderEvents")
+            or []
+        )
+
+        if not isinstance(data_provider_data_list, list):
+            continue
+
+        for dp_data in data_provider_data_list:
+            if not isinstance(dp_data, dict):
+                continue
+
+            provider_name = (
+                dp_data.get("dataProviderName")
+                or dp_data.get("DataProviderName")
+                or "UNKNOWN"
+            )
+
+            events = (
+                dp_data.get("events")
+                or dp_data.get("Events")
+                or []
+            )
+
+            if not isinstance(events, list):
+                continue
+
+            for event in events:
+                if not isinstance(event, dict):
                     continue
-                cluster_id = cluster.get("clusterId") or cluster.get("id") or f"cluster_{i}"
-                all_events.extend(extract_events_from_cluster(cluster, cluster_id, row_meta))
-            if all_events:
-                return all_events
 
-    # Try flat events list (no cluster grouping)
-    for ev_key in ("events", "milestones", "sourceEvents"):
-        evs = sub_data.get(ev_key)
-        if isinstance(evs, list):
-            for ev in evs:
-                if not isinstance(ev, dict):
+                cluster_obj = event.get("cluster") or event.get("Cluster")
+                if not isinstance(cluster_obj, dict):
                     continue
-                cluster_id = ev.get("clusterId") or ev.get("cluster_id") or "unknown"
-                all_events.extend(extract_events_from_cluster(ev, cluster_id, row_meta))
-            if all_events:
-                return all_events
 
-    return all_events
+                cluster_id = (
+                    cluster_obj.get("clusterIdentifier")
+                    or cluster_obj.get("ClusterIdentifier")
+                )
+                if cluster_id is None:
+                    continue
+
+                cluster_ts = (
+                    cluster_obj.get("clusterTimestamp")
+                    or cluster_obj.get("ClusterTimestamp")
+                )
+                cluster_locs = (
+                    cluster_obj.get("clusterLocations")
+                    or cluster_obj.get("ClusterLocations")
+                    or []
+                )
+                cluster_loc_code, cluster_facility_code = extract_cluster_location(cluster_locs)
+
+                if cluster_id not in cluster_map:
+                    event_trigger = (
+                        event.get("eventTrigger")
+                        or event.get("EventTrigger")
+                    )
+                    cluster_map[cluster_id] = {
+                        "clusterIdentifier": cluster_id,
+                        "clusterTimestamp": cluster_ts,
+                        "clusterLocationCode": cluster_loc_code,
+                        "clusterFacilityCode": cluster_facility_code,
+                        "clusterSequenceNumber": None,  # assigned after sort
+                        "eventTrigger": event_trigger,  # from first event
+                        "providers": [],
+                        "events": [],
+                    }
+
+                cluster_entry = cluster_map[cluster_id]
+
+                if provider_name not in cluster_entry["providers"]:
+                    cluster_entry["providers"].append(provider_name)
+
+                ev_loc_code = None
+                ev_locs = event.get("locations") or event.get("Locations") or []
+                if isinstance(ev_locs, list) and ev_locs:
+                    ev_loc_code = extract_unloc(ev_locs[0])
+
+                cluster_entry["events"].append({
+                    "eventTrigger": event.get("eventTrigger") or event.get("EventTrigger"),
+                    "eventTiming": event.get("eventTiming") or event.get("EventTiming"),
+                    "eventTimestamp": event.get("timestamp") or event.get("eventTimestamp"),
+                    "eventLocationCode": ev_loc_code,
+                    "provider": provider_name,
+                    "eventIdentifier": event.get("eventIdentifier") or event.get("eventCorrelationId"),
+                })
+
+    return cluster_map
+
+
+def assign_sequence_numbers(clusters):
+    """Sort clusters by clusterTimestamp (then clusterIdentifier) and assign 1-based sequence numbers."""
+    def sort_key(c):
+        ts = c.get("clusterTimestamp") or ""
+        cid = c.get("clusterIdentifier") or 0
+        return (ts, cid)
+
+    sorted_clusters = sorted(clusters, key=sort_key)
+    for i, cluster in enumerate(sorted_clusters):
+        cluster["clusterSequenceNumber"] = i + 1
+    return sorted_clusters
 
 
 def main():
@@ -180,7 +240,7 @@ def main():
         data = json.load(f)
 
     rows = unwrap_mcp_response(data)
-    all_events = []
+    all_cluster_map = {}
     blob_url = None
     storage_type = "UNKNOWN"
     row_meta = {}
@@ -195,31 +255,39 @@ def main():
 
         sub_data = safe_json(row.get("subscription_data"))
         if sub_data:
-            all_events.extend(parse_subscription_data(sub_data, row_meta))
+            cluster_map = parse_subscription_data(sub_data, row_meta)
+            all_cluster_map.update(cluster_map)
+
+    all_clusters = list(all_cluster_map.values())
+    all_clusters = assign_sequence_numbers(all_clusters)
 
     # Apply filters
     if args.trigger:
-        all_events = [e for e in all_events if e.get("eventTrigger") == args.trigger]
+        all_clusters = [c for c in all_clusters if c.get("eventTrigger") == args.trigger]
     if args.location:
-        all_events = [e for e in all_events if e.get("eventLocationCode") == args.location]
+        all_clusters = [
+            c for c in all_clusters
+            if c.get("clusterLocationCode") == args.location
+            or c.get("clusterFacilityCode") == args.location
+        ]
 
-    if storage_type == "BLOB" and not all_events:
+    if storage_type == "BLOB" and not all_clusters:
         result = {
             "status": "BLOB_STORAGE",
             "message": "subscription_data is stored in external blob — cannot parse in-session",
             "blobUrl": blob_url,
             "journeyId": row_meta.get("journey_id"),
             "unitOfTracking": row_meta.get("unit_of_tracking"),
-            "events": [],
+            "clusters": [],
         }
     else:
         result = {
-            "status": "OK" if all_events else "NOT_FOUND",
+            "status": "OK" if all_clusters else "NOT_FOUND",
             "storageType": storage_type,
             "journeyId": row_meta.get("journey_id"),
             "unitOfTracking": row_meta.get("unit_of_tracking"),
-            "count": len(all_events),
-            "events": all_events,
+            "clusterCount": len(all_clusters),
+            "clusters": all_clusters,
         }
 
     print(json.dumps(result, indent=2))
