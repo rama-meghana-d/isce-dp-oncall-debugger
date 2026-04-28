@@ -10,6 +10,8 @@
 
 Use the sub-skills directly only when you already have a clear problem statement and know the fault category.
 
+When the investigation reaches the data-provider layer (Phase D routes to a DP issue, or you want to confirm whether the problem originates at the provider vs. our transformation code), use `/dp-investigation`.
+
 ---
 
 ### `/triage-ticket`
@@ -174,6 +176,36 @@ Use the sub-skills directly only when you already have a clear problem statement
 
 ---
 
+---
+
+### `/dp-investigation`
+
+**Use when:** You want to determine whether any issue (missing event, wrong timestamp, wrong vessel, wrong transport plan, extra/missing leg, etc.) originates at the **data provider** or inside **DAS-Jobs transformation**. Requires no upfront knowledge of which provider or what type of issue.
+
+**Required input:** `container`, `journey_id`
+
+**Exact steps:**
+1. Queries SIR with a single JOIN: `subscription × data_aggregator_request_mapping` → returns all job IDs + data provider names for the container (no DAS query needed).
+2. Port-forwards `deployment/dp-response-consumer 8085:8080 -n isce-data-sourcing-prod`.
+3. For each job, fetches raw blob via `GET http://localhost:8085/data-provider/{dpId}/job/{jobId}/data/{container}`.
+4. Dispatches to per-provider child skill (`/dp-vizion`, `/dp-gnosis`, `/dp-p44`, `/dp-maersktnt`, `/dp-inttra`, `/dp-pca`, `/dp-seeburger`, `/dp-portcast`, `/dp-coneksion`, `/dp-subscriptionless`, `/dp-bluebox`).
+5. Each child skill produces a side-by-side table: raw field → eventTrigger / eventTiming → kept or dropped (with reason).
+6. Synthesizes a consolidated verdict: DATA PROVIDER / DAS TRANSFORMATION / DOWNSTREAM.
+
+**Output:** Per-provider raw↔transformed table + final layer verdict.
+
+---
+
+### `/milestone-clustering-inspector`
+
+**Use when:** You want to see the cluster breakdown for a specific journey + container — which events are grouped together, the cluster timestamp, cluster location (with alternative codes), and which data providers contributed each event.
+
+**Required input:** `journey_id`, `unit_of_tracking`
+
+**What it does:** Port-forwards to `milestone-processor` in prod, calls `GET /journey/{journeyId}/unitOfTracking/{unitOfTracking}` with `api-version=1`, and renders a per-cluster table showing constituent events with data provider name, individual timestamp, and location code.
+
+---
+
 **Adding a new sub-skill:** Create `.claude/commands/<name>.md` → add one entry to this section → add one row to the Phase E routing table in `incident-root-cause-investigator.md`.
 
 ---
@@ -268,6 +300,7 @@ Two MCP servers, each exposing a single `query({ db, sql })` tool. Pass `db` as 
 | Journey stuck as TRACKING_STOPPED | DOS → SIR → DAS | `dos-db: intelligent_journey` status + `sir-db: subscription` reason | [tracking-stopped-scheduler](isce-data-intelligence/tracking-stopped-scheduler/CLAUDE.md) |
 | Duplicate milestones | DUST → MP → MCE | `dust-db: milestonepipeline` duplicate entries | [dust](isce-data-sourcing/dust/CLAUDE.md), [mce](isce-data-intelligence/mce/CLAUDE.md) |
 | ETD stale / ATD not received / estimated timestamp not updating | SV → DOS → MP → DUST → DAS | `shipment-visibility-db: vessel_voyage_port_call_timestamp` | `/vessel-timestamp-debug` |
+| Clustering behaviour unclear / wrong cluster grouping / unexpected providers in a cluster | Milestone Processor API | `GET /journey/{journeyId}/unitOfTracking/{unitOfTracking}` | `/milestone-clustering-inspector` |
 | Pod crash / restart loop | Pod describe → Liquibase lock | `SELECT locked FROM databasechangeloglock` on affected DB | §5 below |
 
 ---
